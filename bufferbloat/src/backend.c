@@ -269,6 +269,7 @@ static uint32_t half_window(uint32_t cwnd) {
 #define BB_PROBE_CWND 4               // cwnd during the probe, in packets
 #define BB_PROBE_ROUNDS 2             // measuring rounds after the queue drains
 #define BB_SS_EXIT 1.5                // leave slow start once ~1.5 packets are queued
+#define BB_SPIKE 4.0                  // one sample above ~4 queued packets is a spike
 
 static uint64_t now_us(void) {
   struct timeval tv;
@@ -417,6 +418,23 @@ static void bb_on_ack(cmu_socket_t *sock, uint32_t ack) {
         w->bb_round_end = w->highwater;
         log_cc(sock, "bb_exit_ss_fast");
         return;
+      }
+    }
+  }
+
+  // Avoidance: cut a clear spike on this ACK instead of waiting for the round.
+  if (w->cc_state == CC_AVOIDANCE && w->bb_probing == 0 &&
+      !before(ack, w->bb_spike_ok_seq)) {
+    uint64_t base =
+        w->bb_base_cur < w->bb_base_prev ? w->bb_base_cur : w->bb_base_prev;
+    if (rtt > base) {
+      double ratio = (double)base / (double)rtt;
+      double queued = (double)w->cwnd * (1.0 - ratio) / MSS;
+      if (queued > BB_SPIKE) {
+        w->cwnd = (uint32_t)(w->cwnd * ratio) + BB_TARGET * MSS;
+        if (w->cwnd < 2 * (uint32_t)MSS) w->cwnd = 2 * MSS;
+        w->bb_spike_ok_seq = w->highwater;
+        log_cc(sock, "bb_spike_cut");
       }
     }
   }
@@ -1101,6 +1119,7 @@ static void initiator_handshake(cmu_socket_t *sock) {
       sock->window.bb_init = 0;
       sock->window.bb_probing = 0;
       sock->window.bb_head = sock->window.bb_tail = 0;
+      sock->window.bb_spike_ok_seq = 0;
       log_cc(sock, "bb_init");
       stop_timer(sock);
       free(pkt);

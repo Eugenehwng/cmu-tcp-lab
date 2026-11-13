@@ -99,6 +99,7 @@ typedef struct {
   uint64_t bb_probe_min;     // smallest RTT while measuring
   uint64_t bb_next_probe;    // when the next probe should start (us)
   uint64_t bb_last_rtt;      // last round's min RTT, for the restore
+  uint32_t bb_spike_ok_seq;  // ignore spike checks until ACK passes this seq
 
 } window_t;
 
