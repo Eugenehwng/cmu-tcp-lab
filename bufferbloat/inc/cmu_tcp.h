@@ -92,6 +92,13 @@ typedef struct {
   uint64_t bb_round_min;     // 이번 round 동안의 최소 RTT
   uint32_t bb_round_end;     // 이 seq까지 ACK되면 round 끝
   int bb_init;               // 첫 RTT 샘플을 받았는지
+  int bb_probing;            // 0 = normal, 1 = draining, 2 = measuring
+  int bb_probe_rounds;       // measuring rounds finished
+  uint32_t bb_probe_seq;     // this phase ends when ACK reaches this seq
+  uint32_t bb_saved_cwnd;    // cwnd just before the probe
+  uint64_t bb_probe_min;     // smallest RTT while measuring
+  uint64_t bb_next_probe;    // when the next probe should start (us)
+  uint64_t bb_last_rtt;      // last round's min RTT, for the restore
 
 } window_t;
 

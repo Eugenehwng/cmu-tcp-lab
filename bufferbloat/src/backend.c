@@ -265,6 +265,9 @@ static uint32_t half_window(uint32_t cwnd) {
 #define BB_BETA 3.0        // queue가 이보다 많으면 cwnd 감소
 #define BB_TARGET 2        // 줄일 때 남겨둘 queue packet 수
 #define BB_BASE_WIN_US 2000000  // base_rtt 갱신 구간 (2초)
+#define BB_PROBE_INTERVAL_US 2000000  // probe every 2 s
+#define BB_PROBE_CWND 4               // cwnd during the probe, in packets
+#define BB_PROBE_ROUNDS 2             // measuring rounds after the queue drains
 
 static uint64_t now_us(void) {
   struct timeval tv;
@@ -275,6 +278,8 @@ static uint64_t now_us(void) {
 /** Karn's rule: a retransmission makes the old samples ambiguous. */
 static void bb_reset_ring(cmu_socket_t *sock) {
   sock->window.bb_head = sock->window.bb_tail = 0;
+  sock->window.bb_probing = 0;
+  sock->window.bb_next_probe = now_us() + BB_PROBE_INTERVAL_US;
 }
 
 /** Record (end seq, send time) for a newly transmitted data segment. */
@@ -339,6 +344,50 @@ static void bb_on_ack(cmu_socket_t *sock, uint32_t ack) {
     w->bb_round_min = UINT64_MAX;
     w->bb_round_end = w->highwater;
     w->bb_init = 1;
+    w->bb_next_probe = now + BB_PROBE_INTERVAL_US;
+  }
+
+  if (w->bb_probing == 1) {
+    // Drain ends once everything sent before the cut is acknowledged.
+    if (!before(ack, w->bb_probe_seq)) {
+      w->bb_probing = 2;
+      w->bb_probe_rounds = 0;
+      w->bb_probe_min = UINT64_MAX;
+      w->bb_probe_seq = w->highwater;
+    }
+    return;
+  }
+  if (w->bb_probing == 2) {
+    if (rtt < w->bb_probe_min) w->bb_probe_min = rtt;
+    if (!before(ack, w->bb_probe_seq)) {
+      if (++w->bb_probe_rounds < BB_PROBE_ROUNDS) {
+        w->bb_probe_seq = w->highwater;
+        return;
+      }
+      uint64_t base = w->bb_probe_min;
+      w->bb_base_cur = w->bb_base_prev = base;
+      w->bb_base_start = now;
+
+      uint64_t pre = w->bb_last_rtt > base ? w->bb_last_rtt : base;
+      w->cwnd = (uint32_t)((double)w->bb_saved_cwnd * base / pre) +
+                BB_TARGET * MSS;
+      if (w->cwnd < 2 * (uint32_t)MSS) w->cwnd = 2 * MSS;
+
+      w->bb_probing = 0;
+      w->bb_next_probe = now + BB_PROBE_INTERVAL_US;
+      w->bb_round_min = UINT64_MAX;
+      w->bb_round_end = w->highwater;
+      log_cc(sock, "bb_probe_done");
+    }
+    return;
+  }
+  if (w->cc_state == CC_AVOIDANCE && now >= w->bb_next_probe) {
+    w->bb_saved_cwnd = w->cwnd;
+    w->cwnd = BB_PROBE_CWND * MSS;
+    w->bb_probing = 1;
+    w->bb_probe_seq = w->highwater;
+    log_cc(sock, "bb_probe_start");
+    return;
   }
 
   if (now - w->bb_base_start > BB_BASE_WIN_US) {
@@ -353,6 +402,7 @@ static void bb_on_ack(cmu_socket_t *sock, uint32_t ack) {
 
   if (!before(ack, w->bb_round_end)) {
     bb_adjust(sock);
+    w->bb_last_rtt = w->bb_round_min;
     w->bb_round_min = UINT64_MAX;
     w->bb_round_end = w->highwater;
   }
