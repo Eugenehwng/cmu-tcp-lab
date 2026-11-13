@@ -74,6 +74,14 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->window.zero_advertised = 0;
   sock->window.last_wnd_update.tv_sec = 0;
   sock->window.last_wnd_update.tv_usec = 0;
+  sock->window.bb_head = 0;
+  sock->window.bb_tail = 0;
+  sock->window.bb_base_cur = 0;
+  sock->window.bb_base_prev = 0;
+  sock->window.bb_base_start = 0;
+  sock->window.bb_round_min = 0;
+  sock->window.bb_round_end = 0;
+  sock->window.bb_init = 0;
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");

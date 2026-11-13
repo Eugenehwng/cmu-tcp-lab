@@ -261,6 +261,103 @@ static uint32_t half_window(uint32_t cwnd) {
   return half < floor ? floor : half;
 }
 
+#define BB_ALPHA 1.0       // queue가 이보다 적으면 cwnd 증가
+#define BB_BETA 3.0        // queue가 이보다 많으면 cwnd 감소
+#define BB_TARGET 2        // 줄일 때 남겨둘 queue packet 수
+#define BB_BASE_WIN_US 2000000  // base_rtt 갱신 구간 (2초)
+
+static uint64_t now_us(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
+
+/** Karn's rule: a retransmission makes the old samples ambiguous. */
+static void bb_reset_ring(cmu_socket_t *sock) {
+  sock->window.bb_head = sock->window.bb_tail = 0;
+}
+
+/** Record (end seq, send time) for a newly transmitted data segment. */
+static void bb_record(cmu_socket_t *sock, uint32_t seq_end) {
+  window_t *w = &sock->window;
+  uint32_t next = (w->bb_tail + 1) % BB_RING;
+  if (next == w->bb_head) return;
+  w->bb_seq[w->bb_tail] = seq_end;
+  w->bb_t[w->bb_tail] = now_us();
+  w->bb_tail = next;
+}
+
+/** Once per RTT: adjust cwnd from the estimated queue. */
+static void bb_adjust(cmu_socket_t *sock) {
+  window_t *w = &sock->window;
+  uint64_t rtt = w->bb_round_min;
+  uint64_t base = w->bb_base_cur < w->bb_base_prev ? w->bb_base_cur : w->bb_base_prev;
+  if (rtt == UINT64_MAX || base == 0 || rtt < base) return;
+  if (w->cc_state == CC_FAST_RECOVERY) return;
+
+  double ratio = (double)base / (double)rtt;
+  double queued = (double)w->cwnd * (1.0 - ratio) / MSS;
+
+  if (w->cc_state == CC_SLOW_START) {
+    if (queued > BB_BETA) {
+      w->cwnd = (uint32_t)(w->cwnd * ratio) + BB_TARGET * MSS;
+      w->ssthresh = w->cwnd;
+      w->cc_state = CC_AVOIDANCE;
+      log_cc(sock, "bb_exit_ss");
+    }
+    return;
+  }
+
+  if (queued < BB_ALPHA) {
+    w->cwnd += MSS;
+    log_cc(sock, "bb_up");
+  } else if (queued > BB_BETA) {
+    w->cwnd = (uint32_t)(w->cwnd * ratio) + BB_TARGET * MSS;
+    log_cc(sock, "bb_down");
+  }
+  if (w->cwnd < 2 * (uint32_t)MSS) w->cwnd = 2 * MSS;
+}
+
+/** Sample RTT from a new cumulative ACK and adjust once the round ends. */
+static void bb_on_ack(cmu_socket_t *sock, uint32_t ack) {
+  window_t *w = &sock->window;
+  uint64_t sent = 0;
+  int got = 0;
+  while (w->bb_head != w->bb_tail && !after(w->bb_seq[w->bb_head], ack)) {
+    sent = w->bb_t[w->bb_head];
+    got = 1;
+    w->bb_head = (w->bb_head + 1) % BB_RING;
+  }
+  if (!got) return;
+
+  uint64_t now = now_us();
+  uint64_t rtt = now - sent;
+
+  if (!w->bb_init) {
+    w->bb_base_cur = w->bb_base_prev = rtt;
+    w->bb_base_start = now;
+    w->bb_round_min = UINT64_MAX;
+    w->bb_round_end = w->highwater;
+    w->bb_init = 1;
+  }
+
+  if (now - w->bb_base_start > BB_BASE_WIN_US) {
+    w->bb_base_prev = w->bb_base_cur;
+    w->bb_base_cur = rtt;
+    w->bb_base_start = now;
+  } else if (rtt < w->bb_base_cur) {
+    w->bb_base_cur = rtt;
+  }
+
+  if (rtt < w->bb_round_min) w->bb_round_min = rtt;
+
+  if (!before(ack, w->bb_round_end)) {
+    bb_adjust(sock);
+    w->bb_round_min = UINT64_MAX;
+    w->bb_round_end = w->highwater;
+  }
+}
+
 static void on_timeout(cmu_socket_t *sock) {
   sock->window.ssthresh = half_window(sock->window.cwnd);
   // The published Reno diagram restarts slow start at one segment. The
@@ -314,13 +411,7 @@ static void on_new_ack(cmu_socket_t *sock, uint32_t acked) {
   }
 
   sock->window.cc_state = CC_AVOIDANCE;
-  if (sock->window.cwnd == 0) return;
-  uint64_t credit =
-      (uint64_t)MSS * (uint64_t)acked + sock->window.ca_carry;
-  uint32_t inc = (uint32_t)(credit / sock->window.cwnd);
-  sock->window.ca_carry = (uint32_t)(credit % sock->window.cwnd);
-  sock->window.cwnd += inc;
-  if (inc > 0) log_cc(sock, "congestion_avoidance_ack");
+  return;  // avoidance growth is bb_adjust(), once per RTT
 }
 
 /**
@@ -587,7 +678,6 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   uint16_t prev_adv = sock->window.peer_adv_window;
   uint16_t new_adv = get_advertised_window(hdr);
   note_peer_window(sock, new_adv);
-  int window_update = new_adv != prev_adv;
 
   if (is_syn) {
     // A retransmitted SYN-ACK after we are ESTABLISHED means our final
@@ -612,6 +702,7 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
         sock->window.next_seq_to_send = ack;
       }
       on_new_ack(sock, acked);
+      bb_on_ack(sock, ack);
       if (sock->window.last_ack_received == sock->window.highwater) {
         stop_timer(sock);
       } else {
@@ -635,6 +726,8 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
     }
   }
 
+#if 0  // bufferbloat: jumping cwnd to the advertised window overflows the router
+  int window_update = new_adv != prev_adv;
   // Still in slow start, and the peer opened a window larger than cwnd.
   // The send window is min(cwnd, advertised window); raise cwnd up to the
   // new advertisement (but not past ssthresh) so a window increase is not
@@ -650,6 +743,7 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
       log_cc(sock, "adv_raise");
     }
   }
+#endif
 
   if (payload_len > 0) {
     uint32_t seq = get_seq(hdr);
@@ -742,6 +836,7 @@ void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags) {
  */
 static void retransmit_oldest(cmu_socket_t *sock, uint8_t *data,
                               uint32_t seq_base) {
+  bb_reset_ring(sock);
   uint32_t seq = sock->window.last_ack_received;
   // Prefer the high-water mark: next_seq may have been rewound by a timeout.
   uint32_t sent_end = sock->window.highwater;
@@ -820,6 +915,7 @@ void single_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
     if (timer_expired(sock) &&
         after(sock->window.highwater, sock->window.last_ack_received)) {
       on_timeout(sock);
+      bb_reset_ring(sock);
       // Rewind the send cursor and arm a fresh RTO. Leaving the old timer
       // running would make every following iteration look like another timeout.
       sock->window.next_seq_to_send = sock->window.last_ack_received;
@@ -867,6 +963,9 @@ void single_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
           (uint16_t)MIN((uint32_t)MSS, MIN(remaining, room));
       if (payload_len == 0) break;
 
+      if (!before(sock->window.next_seq_to_send, sock->window.highwater)) {
+        bb_record(sock, sock->window.next_seq_to_send + payload_len);
+      }
       send_data_segment(sock, data, seq_base, sock->window.next_seq_to_send,
                         payload_len);
       if (!sock->window.timer_running) start_timer(sock);
@@ -924,6 +1023,11 @@ static void initiator_handshake(cmu_socket_t *sock) {
       sock->window.next_seq_to_send = my_isn + 1;
       sock->window.highwater = my_isn + 1;
       sock->window.state = ESTABLISHED;
+      // Start small and let slow start grow until delay says the queue formed.
+      sock->window.cwnd = 2 * MSS;
+      sock->window.ssthresh = 65535;
+      sock->window.cc_state = CC_SLOW_START;
+      log_cc(sock, "bb_init");
       stop_timer(sock);
       free(pkt);
       return;

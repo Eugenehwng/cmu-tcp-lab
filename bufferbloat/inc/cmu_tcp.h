@@ -45,6 +45,8 @@ typedef enum {
   CC_FAST_RECOVERY = 2,
 } cc_state_t;
 
+#define BB_RING 256  // 동시에 기록할 수 있는 segment 수 (in-flight보다 넉넉하게)
+
 typedef struct {
   // Sender-side
   uint32_t last_ack_received; // window left edge
@@ -78,6 +80,18 @@ typedef struct {
   // Set when we advertise 0, so a later read can open the window again.
   int zero_advertised;
   struct timeval last_wnd_update;
+
+  // bufferbloat: RTT samples and delay-based congestion control.
+  uint32_t bb_seq[BB_RING];  // 보낸 segment의 끝 seq
+  uint64_t bb_t[BB_RING];    // 그 segment를 보낸 시각 (us)
+  uint32_t bb_head;          // ring: 가장 오래된 기록
+  uint32_t bb_tail;          // ring: 다음에 쓸 자리
+  uint64_t bb_base_cur;      // 현재 구간의 최소 RTT
+  uint64_t bb_base_prev;     // 직전 구간의 최소 RTT
+  uint64_t bb_base_start;    // 현재 구간 시작 시각
+  uint64_t bb_round_min;     // 이번 round 동안의 최소 RTT
+  uint32_t bb_round_end;     // 이 seq까지 ACK되면 round 끝
+  int bb_init;               // 첫 RTT 샘플을 받았는지
 
 } window_t;
 
