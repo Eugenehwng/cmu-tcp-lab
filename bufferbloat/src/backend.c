@@ -261,9 +261,9 @@ static uint32_t half_window(uint32_t cwnd) {
   return half < floor ? floor : half;
 }
 
-#define BB_ALPHA 1.0       // queue가 이보다 적으면 cwnd 증가
-#define BB_BETA 3.0        // queue가 이보다 많으면 cwnd 감소
-#define BB_TARGET 2        // 줄일 때 남겨둘 queue packet 수
+#define BB_ALPHA 0.5      // queue가 이보다 적으면 cwnd 증가
+#define BB_BETA 1.5       // queue가 이보다 많으면 cwnd 감소
+#define BB_TARGET 1        // 줄일 때 남겨둘 queue packet 수
 #define BB_BASE_WIN_US 2000000  // base_rtt 갱신 구간 (2초)
 #define BB_PROBE_INTERVAL_US 2000000  // probe every 2 s
 #define BB_PROBE_CWND 4               // cwnd during the probe, in packets
