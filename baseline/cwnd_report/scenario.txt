@@ -1,0 +1,20 @@
+File size: 4194304 bytes (/tmp/payload.bin, 4 MiB of random data).
+Sender: ./client (TCP_INITIATOR). Receiver: ./server (TCP_LISTENER).
+Interface: lo, inside one Linux network namespace.
+
+Steady configuration, equivalent to:
+  sudo tcset lo --rate 5Mbps --delay 10ms --loss 0.3% --overwrite
+Applied with:
+  tc qdisc replace dev lo root netem delay 10ms rate 5mbit loss 0.3%
+
+Timeout burst, from 3.0 s to 5.6 s after the client starts (shorter than the
+3000 ms RTO, so the retransmission is not dropped too):
+  tc qdisc replace dev lo root netem delay 10ms rate 5mbit loss 100%
+Then the 0.3% configuration is restored.
+
+Loss on lo affects both data and ACKs. The fixed RTO is DEFAULT_TIMEOUT (3000 ms).
+Client exit code: 0
+Client output:
+4194304 11.103091
+Server output:
+got 4194304
